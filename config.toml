@@ -1,0 +1,24 @@
+corner_radius = 12.0
+note_file = "note.txt"
+window_x = 100.0
+window_y = 100.0
+
+[background]
+r = 45
+g = 45
+b = 48
+a = 20
+
+[text]
+r = 192
+g = 143
+b = 83
+a = 255
+font_family = "C:/Windows/Fonts/msyh.ttc"
+font_size = 16.0
+
+[padding]
+left = 16.0
+top = 12.0
+right = 16.0
+bottom = 12.0
