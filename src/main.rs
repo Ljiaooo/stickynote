@@ -46,7 +46,6 @@ fn main() {
         "StickyNote",
         options,
         Box::new(move |cc| {
-            // 加载自定义字体
             if let Ok(font_data) = std::fs::read(&font_path) {
                 let mut fonts = egui::FontDefinitions::default();
                 fonts.font_data.insert(

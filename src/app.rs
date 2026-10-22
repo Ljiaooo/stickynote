@@ -4,6 +4,188 @@ use std::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
+#[derive(Debug, PartialEq)]
+enum Line<'a> {
+    Plain(&'a str),
+    Heading(usize, &'a str),
+    Unordered(&'a str),
+    Ordered(&'a str),
+}
+
+#[allow(non_snake_case)]
+fn parseLine(line: &str) -> Line<'_> {
+    let headings = line.bytes().take_while(|&byte| byte == b'#').count();
+    if (1..=6).contains(&headings) {
+        if let Some(text) = line[headings..].strip_prefix(' ') {
+            return Line::Heading(headings, text);
+        }
+    }
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(text) = line.strip_prefix(marker) {
+            return Line::Unordered(text);
+        }
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && line[digits..].starts_with(". ") {
+        return Line::Ordered(line);
+    }
+    Line::Plain(line)
+}
+
+struct TextLayout {
+    _lines: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
+    _size: egui::Vec2,
+}
+
+#[allow(non_snake_case)]
+fn layoutText(
+    ctx: &egui::Context,
+    text: &str,
+    font: &egui::FontId,
+    color: egui::Color32,
+) -> TextLayout {
+    let mut layout = TextLayout {
+        _lines: Vec::new(),
+        _size: egui::Vec2::ZERO,
+    };
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect()
+    };
+    for line in lines {
+        let (text, scale, indent) = match parseLine(line) {
+            Line::Plain(text) => (text.to_owned(), 1.0, 0.0),
+            Line::Heading(level, text) => (
+                text.to_owned(),
+                [2.0, 1.8, 1.6, 1.4, 1.2, 1.1][level - 1],
+                0.0,
+            ),
+            Line::Unordered(text) => (format!("\u{2022} {text}"), 1.0, font.size),
+            Line::Ordered(text) => (text.to_owned(), 1.0, font.size),
+        };
+        let font = egui::FontId::new(font.size * scale, font.family.clone());
+        let (galley, height) = ctx.fonts_mut(|fonts| {
+            let height = fonts.row_height(&font);
+            let galley = fonts.layout_no_wrap(text, font, color);
+            let height = height.max(galley.size().y);
+            (galley, height)
+        });
+        layout._size.x = layout._size.x.max(indent + galley.size().x);
+        layout
+            ._lines
+            .push((egui::pos2(indent, layout._size.y), galley));
+        layout._size.y += height;
+    }
+    layout
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn parsesHeadings() {
+        for level in 1..=6 {
+            let input = format!("{} Title", "#".repeat(level));
+            assert_eq!(parseLine(&input), Line::Heading(level, "Title"));
+        }
+        assert_eq!(parseLine("# "), Line::Heading(1, ""));
+        assert_eq!(parseLine("##  Title #"), Line::Heading(2, " Title #"));
+        assert_eq!(
+            parseLine("# \u{6807}\u{9898}"),
+            Line::Heading(1, "\u{6807}\u{9898}")
+        );
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn parsesLists() {
+        for marker in ["-", "*", "+"] {
+            assert_eq!(
+                parseLine(&format!("{marker} Item")),
+                Line::Unordered("Item")
+            );
+        }
+        assert_eq!(parseLine("- "), Line::Unordered(""));
+        assert_eq!(parseLine("-  Item"), Line::Unordered(" Item"));
+        for input in [
+            "1. Item",
+            "001. Item",
+            "0. ",
+            "999999999999999999999999999999. Item",
+        ] {
+            assert_eq!(parseLine(input), Line::Ordered(input));
+        }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn laysOutMarkdown() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let ctx = ui.ctx();
+            let font = egui::FontId::proportional(16.0);
+            let color = egui::Color32::WHITE;
+            let plain = layoutText(ctx, "Title", &font, color);
+            let heading = layoutText(ctx, "# Title", &font, color);
+            assert_eq!(heading._lines[0].1.text(), "Title");
+            assert!(heading._size.y > plain._size.y);
+            let mixed = layoutText(
+                ctx,
+                "# Title\r\n\r\n- Item\r\n001. Item\r\nText\r\n",
+                &font,
+                color,
+            );
+            assert_eq!(mixed._lines.len(), 5);
+            assert_eq!(mixed._lines[2].1.text(), "\u{2022} Item");
+            assert_eq!(mixed._lines[3].1.text(), "001. Item");
+            assert_eq!(mixed._lines[2].0.x, font.size);
+            assert_eq!(mixed._lines[3].0.x, font.size);
+            for pair in mixed._lines.windows(2) {
+                assert!(pair[1].0.y >= pair[0].0.y + pair[0].1.size().y);
+            }
+            for (pos, galley) in &mixed._lines {
+                assert!(pos.x + galley.size().x <= mixed._size.x);
+                assert!(pos.y + galley.size().y <= mixed._size.y);
+            }
+            let empty = layoutText(ctx, "", &font, color);
+            assert_eq!(empty._lines.len(), 1);
+            assert!(empty._size.y > 0.0);
+            let blanks = layoutText(ctx, "\n\n", &font, color);
+            assert_eq!(blanks._lines.len(), 2);
+            assert_eq!(blanks._size.y, empty._size.y * 2.0);
+            let plain = layoutText(ctx, "  Text  ", &font, color);
+            assert_eq!(plain._lines[0].1.text(), "  Text  ");
+            assert_eq!(plain._lines[0].0.x, 0.0);
+        });
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn preservesPlainText() {
+        for input in [
+            "",
+            "Text",
+            "  Text  ",
+            "#Title",
+            "####### Title",
+            " # Title",
+            "-\tItem",
+            "-Item",
+            "  - Item",
+            "1.Item",
+            "1) Item",
+            "\u{ff11}. Item",
+            "**Bold**",
+            "#\tTitle",
+        ] {
+            assert_eq!(parseLine(input), Line::Plain(input));
+        }
+    }
+}
+
 pub struct StickyNoteApp {
     config: Config,
     note_path: PathBuf,
@@ -23,9 +205,6 @@ impl StickyNoteApp {
         rx: mpsc::Receiver<()>,
         watcher: notify::RecommendedWatcher,
     ) -> Self {
-        // 托盘图标放在独立线程中，运行自己的 Win32 消息循环。
-        // winit 的事件循环不会分发托盘隐藏窗口的消息，
-        // 因此必须在拥有托盘窗口的线程上泵送消息，事件才能到达全局 channel。
         let (id_tx, id_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let menu = Menu::new();
@@ -39,12 +218,6 @@ impl StickyNoteApp {
                 .with_menu(Box::new(menu))
                 .build()
                 .expect("build tray icon");
-
-            debug_log(&format!(
-                "tray created on thread {:?}, exit_id={:?}",
-                std::thread::current().id(),
-                exit_id
-            ));
 
             id_tx.send(exit_id).expect("send exit menu id");
             run_message_loop();
@@ -75,33 +248,21 @@ impl StickyNoteApp {
 }
 
 impl eframe::App for StickyNoteApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx();
 
-        // 定期唤醒以轮询托盘事件
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
 
-        debug_log(&format!(
-            "ui frame on thread {:?}, taskbar_hidden={}",
-            std::thread::current().id(),
-            self.taskbar_hidden
-        ));
-
-        // 处理托盘菜单事件
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            debug_log(&format!("MenuEvent received: {:?}", event.id));
             if event.id == self.exit_menu_id {
-                debug_log("Exit matched, sending Close");
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
 
-        // 诊断：记录所有托盘事件
-        while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
-            debug_log(&format!("TrayIconEvent received: {:?}", event));
-        }
-
-        // 从任务栏隐藏窗口（仅一次）
         if !self.taskbar_hidden {
             if let Some(window) = frame.winit_window() {
                 use winit::platform::windows::WindowExtWindows;
@@ -110,7 +271,6 @@ impl eframe::App for StickyNoteApp {
             }
         }
 
-        // 检查文件变化
         while self.rx.try_recv().is_ok() {
             self.reload_text();
         }
@@ -120,62 +280,33 @@ impl eframe::App for StickyNoteApp {
         let bg_color = self.config.bg_color();
         let padding = &self.config.padding;
 
-        // 计算多行文本尺寸
-        let lines: Vec<&str> = self.text.lines().collect();
-        let lines = if lines.is_empty() { vec![""] } else { lines };
+        let layout = layoutText(ctx, &self.text, &font_id, text_color);
 
-        let mut max_width: f32 = 0.0;
-        let line_height = ctx.fonts_mut(|f| f.row_height(&font_id));
-
-        for line in &lines {
-            let galley = ctx.fonts_mut(|f| {
-                f.layout_no_wrap((*line).to_owned(), font_id.clone(), text_color)
-            });
-            max_width = max_width.max(galley.size().x);
-        }
-
-        let total_height = line_height * lines.len() as f32;
-
-        // 窗口目标尺寸
-        let target_w = max_width + padding.left + padding.right;
-        let target_h = total_height + padding.top + padding.bottom;
+        let target_w = layout._size.x + padding.left + padding.right;
+        let target_h = layout._size.y + padding.top + padding.bottom;
         let target_size = egui::vec2(target_w.max(50.0), target_h.max(30.0));
 
-        // 尺寸变化超过阈值时才调整窗口
         if (target_size - self.last_size).length() > 1.0 {
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_size));
             self.last_size = target_size;
         }
 
-        // 渲染
         let painter = ui.painter();
         let rect = ui.max_rect();
 
-        // 圆角矩形背景
         painter.rect_filled(rect, self.config.corner_radius, bg_color);
 
-        // 逐行绘制文本
-        let mut y = rect.min.y + padding.top;
-        for line in &lines {
-            let pos = egui::pos2(rect.min.x + padding.left, y);
-            painter.text(
-                pos,
-                egui::Align2::LEFT_TOP,
-                *line,
-                font_id.clone(),
-                text_color,
-            );
-            y += line_height;
+        let origin = rect.min + egui::vec2(padding.left, padding.top);
+        for (offset, galley) in layout._lines {
+            painter.galley(origin + offset.to_vec2(), galley, text_color);
         }
 
-        // 左键按下时启动窗口拖动
         let response = ui.interact(rect, ui.id().with("drag_area"), egui::Sense::drag());
         let primary_pressed = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
         if response.is_pointer_button_down_on() && primary_pressed {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
 
-        // 右键打开外部编辑器
         let secondary_clicked = ctx.input(|i| i.pointer.secondary_clicked());
         if secondary_clicked {
             open_editor(&self.note_path);
@@ -184,15 +315,14 @@ impl eframe::App for StickyNoteApp {
 }
 
 fn open_editor(path: &std::path::Path) {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", &path.to_string_lossy()])
-            .spawn();
-    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", &path.to_string_lossy()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
 }
 
-// 在托盘线程上泵送 Win32 消息，使托盘隐藏窗口能收到并分发消息
 #[cfg(target_os = "windows")]
 fn run_message_loop() {
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -210,19 +340,6 @@ fn run_message_loop() {
 #[cfg(not(target_os = "windows"))]
 fn run_message_loop() {}
 
-// 临时调试日志：写入 stickynote_debug.log
-fn debug_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("stickynote_debug.log")
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-}
-
-// 生成 32x32 黄色圆角方块托盘图标
 fn make_tray_icon() -> Icon {
     const SIZE: u32 = 32;
     let radius = 5.0_f32;
