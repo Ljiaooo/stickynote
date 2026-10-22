@@ -8,8 +8,7 @@ use tray_icon::{Icon, TrayIconBuilder};
 enum Line<'a> {
     Plain(&'a str),
     Heading(usize, &'a str),
-    Unordered(&'a str),
-    Ordered(&'a str),
+    Unordered(usize, &'a str),
 }
 
 #[allow(non_snake_case)]
@@ -20,14 +19,13 @@ fn parseLine(line: &str) -> Line<'_> {
             return Line::Heading(headings, text);
         }
     }
-    for marker in ["- ", "* ", "+ "] {
-        if let Some(text) = line.strip_prefix(marker) {
-            return Line::Unordered(text);
+    let spaces = line.bytes().take_while(|&byte| byte == b' ').count();
+    if matches!(spaces, 0 | 2 | 4) {
+        for marker in ["- ", "* ", "+ "] {
+            if let Some(text) = line[spaces..].strip_prefix(marker) {
+                return Line::Unordered(spaces / 2 + 1, text);
+            }
         }
-    }
-    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-    if digits > 0 && line[digits..].starts_with(". ") {
-        return Line::Ordered(line);
     }
     Line::Plain(line)
 }
@@ -61,8 +59,9 @@ fn layoutText(
                 [2.0, 1.8, 1.6, 1.4, 1.2, 1.1][level - 1],
                 0.0,
             ),
-            Line::Unordered(text) => (format!("\u{2022} {text}"), 1.0, font.size),
-            Line::Ordered(text) => (text.to_owned(), 1.0, font.size),
+            Line::Unordered(level, text) => {
+                (format!("\u{2022} {text}"), 1.0, font.size * level as f32)
+            }
         };
         let font = egui::FontId::new(font.size * scale, font.family.clone());
         let (galley, height) = ctx.fonts_mut(|fonts| {
@@ -80,9 +79,85 @@ fn layoutText(
     layout
 }
 
+#[allow(non_snake_case)]
+fn handleTrayEvent(
+    ctx: &egui::Context,
+    event: MenuEvent,
+    toggleItem: &MenuItem,
+    exitId: &tray_icon::menu::MenuId,
+    visible: &mut bool,
+) {
+    if event.id == *exitId {
+        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close);
+    } else if event.id == *toggleItem.id() {
+        *visible = !*visible;
+        toggleItem.set_text(if *visible { "Hide" } else { "Show" });
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::Visible(*visible),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn trayTogglesVisibilityAndExitsWhileHidden() {
+        let ctx = egui::Context::default();
+        let toggleItem = MenuItem::new("Hide", true, None);
+        let exitItem = MenuItem::new("Exit", true, None);
+        let mut visible = true;
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        for expected in [false, true, false] {
+            handleTrayEvent(
+                &ctx,
+                MenuEvent {
+                    id: toggleItem.id().clone(),
+                },
+                &toggleItem,
+                exitItem.id(),
+                &mut visible,
+            );
+            assert_eq!(visible, expected);
+            assert_eq!(toggleItem.text(), if expected { "Hide" } else { "Show" });
+            let output = ctx.run_ui(egui::RawInput::default(), |_| {});
+            assert!(output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Visible(expected)));
+        }
+        handleTrayEvent(
+            &ctx,
+            MenuEvent {
+                id: exitItem.id().clone(),
+            },
+            &toggleItem,
+            exitItem.id(),
+            &mut visible,
+        );
+        let output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .contains(&egui::ViewportCommand::Close));
+        assert!(!visible);
+        let unrelatedItem = MenuItem::new("Unrelated", true, None);
+        handleTrayEvent(
+            &ctx,
+            MenuEvent {
+                id: unrelatedItem.id().clone(),
+            },
+            &toggleItem,
+            exitItem.id(),
+            &mut visible,
+        );
+        let output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        assert!(output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .is_empty());
+        assert!(!visible);
+    }
 
     #[test]
     #[allow(non_snake_case)]
@@ -105,19 +180,44 @@ mod tests {
         for marker in ["-", "*", "+"] {
             assert_eq!(
                 parseLine(&format!("{marker} Item")),
-                Line::Unordered("Item")
+                Line::Unordered(1, "Item")
             );
         }
-        assert_eq!(parseLine("- "), Line::Unordered(""));
-        assert_eq!(parseLine("-  Item"), Line::Unordered(" Item"));
+        assert_eq!(parseLine("- "), Line::Unordered(1, ""));
+        assert_eq!(parseLine("-  Item"), Line::Unordered(1, " Item"));
+        assert_eq!(parseLine("  - "), Line::Unordered(2, ""));
+        assert_eq!(parseLine("    +  Item"), Line::Unordered(3, " Item"));
         for input in [
             "1. Item",
             "001. Item",
             "0. ",
             "999999999999999999999999999999. Item",
         ] {
-            assert_eq!(parseLine(input), Line::Ordered(input));
+            assert_eq!(parseLine(input), Line::Plain(input));
         }
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn laysOutThreeListLevels() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let font = egui::FontId::proportional(16.0);
+            let color = egui::Color32::WHITE;
+            for marker in ["-", "*", "+"] {
+                for level in 1..=3 {
+                    let input = format!("{}{marker} Item", "  ".repeat(level - 1));
+                    let layout = layoutText(ui.ctx(), &input, &font, color);
+                    assert_eq!(layout._lines[0].1.text(), "\u{2022} Item");
+                    assert_eq!(layout._lines[0].0.x, font.size * level as f32);
+                    assert!(layout._size.x >= layout._lines[0].0.x + layout._lines[0].1.size().x);
+                }
+            }
+            for input in ["  - ", "    +  Item"] {
+                let layout = layoutText(ui.ctx(), input, &font, color);
+                assert!(layout._lines[0].1.text().starts_with("\u{2022} "));
+            }
+        });
     }
 
     #[test]
@@ -142,7 +242,7 @@ mod tests {
             assert_eq!(mixed._lines[2].1.text(), "\u{2022} Item");
             assert_eq!(mixed._lines[3].1.text(), "001. Item");
             assert_eq!(mixed._lines[2].0.x, font.size);
-            assert_eq!(mixed._lines[3].0.x, font.size);
+            assert_eq!(mixed._lines[3].0.x, 0.0);
             for pair in mixed._lines.windows(2) {
                 assert!(pair[1].0.y >= pair[0].0.y + pair[0].1.size().y);
             }
@@ -174,7 +274,16 @@ mod tests {
             " # Title",
             "-\tItem",
             "-Item",
-            "  - Item",
+            " - Item",
+            "   - Item",
+            "     - Item",
+            "      - Item",
+            "        * Item",
+            "\t- Item",
+            "  \t- Item",
+            "  1. Item",
+            "  -Item",
+            "    -\tItem",
             "1.Item",
             "1) Item",
             "\u{ff11}. Item",
@@ -193,7 +302,6 @@ pub struct StickyNoteApp {
     rx: mpsc::Receiver<()>,
     _watcher: notify::RecommendedWatcher,
     last_size: egui::Vec2,
-    exit_menu_id: tray_icon::menu::MenuId,
     taskbar_hidden: bool,
 }
 
@@ -204,12 +312,15 @@ impl StickyNoteApp {
         text: String,
         rx: mpsc::Receiver<()>,
         watcher: notify::RecommendedWatcher,
+        ctx: egui::Context,
     ) -> Self {
-        let (id_tx, id_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let menu = Menu::new();
+            let toggle_item = MenuItem::new("Hide", true, None);
             let exit_item = MenuItem::new("Exit", true, None);
-            let exit_id = exit_item.id().clone();
+            menu.append(&toggle_item)
+                .expect("append visibility menu item");
             menu.append(&exit_item).expect("append exit menu item");
 
             let _tray_icon = TrayIconBuilder::new()
@@ -219,10 +330,10 @@ impl StickyNoteApp {
                 .build()
                 .expect("build tray icon");
 
-            id_tx.send(exit_id).expect("send exit menu id");
-            run_message_loop();
+            ready_tx.send(()).expect("send tray ready signal");
+            run_message_loop(&ctx, &toggle_item, exit_item.id());
         });
-        let exit_menu_id = id_rx.recv().expect("receive exit menu id");
+        ready_rx.recv().expect("receive tray ready signal");
 
         Self {
             config,
@@ -231,7 +342,6 @@ impl StickyNoteApp {
             rx,
             _watcher: watcher,
             last_size: egui::Vec2::ZERO,
-            exit_menu_id,
             taskbar_hidden: false,
         }
     }
@@ -256,12 +366,6 @@ impl eframe::App for StickyNoteApp {
         let ctx = ui.ctx();
 
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
-
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id == self.exit_menu_id {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        }
 
         if !self.taskbar_hidden {
             if let Some(window) = frame.winit_window() {
@@ -324,21 +428,35 @@ fn open_editor(path: &std::path::Path) {
 }
 
 #[cfg(target_os = "windows")]
-fn run_message_loop() {
+fn run_message_loop(
+    ctx: &egui::Context,
+    toggle_item: &MenuItem,
+    exit_id: &tray_icon::menu::MenuId,
+) {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, TranslateMessage, MSG,
     };
+    let mut visible = true;
     unsafe {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            // 隐藏窗口不执行 App::ui；菜单分发结束后在所属线程更新菜单并唤醒窗口。
+            while let Ok(event) = MenuEvent::receiver().try_recv() {
+                handleTrayEvent(ctx, event, toggle_item, exit_id, &mut visible);
+            }
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn run_message_loop() {}
+fn run_message_loop(
+    _ctx: &egui::Context,
+    _toggle_item: &MenuItem,
+    _exit_id: &tray_icon::menu::MenuId,
+) {
+}
 
 fn make_tray_icon() -> Icon {
     const SIZE: u32 = 32;

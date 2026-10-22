@@ -66,6 +66,7 @@ fn main() {
                 text,
                 rx,
                 file_watcher,
+                cc.egui_ctx.clone(),
             )))
         }),
     )
